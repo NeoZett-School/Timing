@@ -88,7 +88,8 @@ class RandomDef:
         chance = []
         items = list(items or []) + list(args)
         for item in items:
-            if not item: continue
+            if item is None:
+                continue
             real.append(item.value)
             chance.append(item.chance)
         return definition._random.choices(real, chance)[0]

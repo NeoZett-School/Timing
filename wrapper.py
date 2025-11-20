@@ -3,7 +3,8 @@ The wrapper util is a simple script that provides threading and wrapping.
 For a good cleanup, you have to call `cleanup` when you are done.
 """
 
-from typing import List, Optional, Union, Callable, Type, TypeVar, ParamSpec, Generic, Final, Any
+from typing import List, Optional, Union, Callable, Generator, Type, TypeVar, ParamSpec, Generic, Final, Any
+from contextlib import contextmanager
 from types import new_class
 import weakref
 import threading
@@ -110,8 +111,10 @@ class Resolve(Generic[T3]):
         # adopt it. (Note: parent._result is *last* run — may be racy if there are
         # concurrent calls; prefer per-call resolve for correctness.)
         parent = self._threaded_method
-        parent_result = getattr(parent, "_last_result", MISSING)
-        if parent.complete and parent_result is not MISSING:
+        with getattr(parent, "_lock"):
+            parent_result = getattr(parent, "_last_result", MISSING)
+            parent_complete = parent.complete
+        if parent_complete and parent_result is not MISSING:
             with self._rlock:
                 if self._value is MISSING and self._exc is None:
                     self._set_value(parent_result)
@@ -328,3 +331,11 @@ def cleanup(timeout: Optional[float] = None) -> None:
             remaining = None if timeout is None else max(0.0, timeout - (time.monotonic() - start))
             t.join(remaining)
     _threaded_methods.clear()
+
+
+@contextmanager
+def cleanup_context(timeout: Optional[float] = None) -> Generator[None, Any, None]:
+    try:
+        yield
+    finally:
+        cleanup(timeout)
