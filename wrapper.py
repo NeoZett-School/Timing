@@ -1,9 +1,16 @@
-from typing import Optional, Union, Callable, Type, TypeVar, ParamSpec, Generic, Any
+"""
+The wrapper util is a simple script that provides threading and wrapping.
+For a good cleanup, you have to call `cleanup` when you are done.
+"""
+
+from typing import List, Optional, Union, Callable, Type, TypeVar, ParamSpec, Generic, Final, Any
+from types import new_class
+import weakref
 import threading
 import functools
 import time
 
-class ThreadedException(BaseException):
+class ThreadedException(Exception):
     """Any exception that is threaded."""
 
 T = TypeVar("T")
@@ -13,27 +20,31 @@ P = ParamSpec("P")
 P2 = ParamSpec("P2")
 
 # single-instance sentinel (use instance, not class)
-MISSING = object()
+MISSING: Final = object()
 
-_threads: list[threading.Thread] = []
+_threads: List[threading.Thread] = []
+_resolves: weakref.WeakSet["Resolve"] = weakref.WeakSet()
+_threaded_methods: weakref.WeakSet["ThreadedMethod"] = weakref.WeakSet()
 
-def _new_thread(target: Callable[..., Any], *args: Any, **kwargs: Any) -> threading.Thread:
+def new_basic_thread(target: Callable[..., Any], *args: Any, **kwargs: Any) -> threading.Thread:
     """Create a thread and register it; do not start it here (caller decides)."""
     thread = threading.Thread(target=target, args=args, kwargs=kwargs)
     _threads.append(thread)
     return thread
 
 class Resolve(Generic[T3]):
-    __slots__ = ("_threaded_method", "_watch_thread", "_lock", "_event", "_value", "_exc")
+    __slots__ = ("_threaded_method", "_watch_thread", "_lock", "_rlock", "_event", "_value", "_exc", "__weakref__")
 
     def __init__(self, threaded_method: "ThreadedMethod"):
         # use object.__setattr__ to bypass our __setattr__
         object.__setattr__(self, "_threaded_method", threaded_method)
         object.__setattr__(self, "_watch_thread", threading.Thread(target=self._watcher, daemon=threaded_method._daemon, kwargs={"capture": True}))
         object.__setattr__(self, "_lock", threading.Lock())
+        object.__setattr__(self, "_rlock", threading.RLock())
         object.__setattr__(self, "_event", threading.Event())
         object.__setattr__(self, "_value", MISSING)
         object.__setattr__(self, "_exc", None)
+        _resolves.add(self)
 
     # read-only accessors
     @property
@@ -48,6 +59,11 @@ class Resolve(Generic[T3]):
     def value(self) -> Optional[T3]:
         with self._lock:
             return None if self._value is MISSING else self._value  # Optional[T3]
+    
+    @property
+    def has_value(self) -> bool:
+        with self._lock:
+            return self._value is not MISSING and self.done
 
     # internal setters used by the worker
     def _set_value(self, value: T3) -> None:
@@ -76,11 +92,15 @@ class Resolve(Generic[T3]):
         """Capture the result in this very moment."""
         # If parent completed and parent _result isn't MISSING, capture it.
         parent = self._threaded_method
-        parent_result = parent._result
-        if parent.complete and parent_result is not MISSING and self._value is MISSING:
-            # set parent's result into us if we don't have it yet
-            self._set_value(parent_result)
-            return parent_result
+        parent_result = getattr(self._threaded_method, "_result", MISSING)
+        with self._rlock:
+            if self._exc is not None:
+                self._raise()
+            if parent.complete and parent_result is not MISSING:
+                # set parent's result into us if we don't have it yet
+                if self._value is MISSING:
+                    self._set_value(parent_result)
+                    return parent_result
         return self.value
 
     # watcher thread function used by start_recording
@@ -128,6 +148,7 @@ class ThreadedMethod(Generic[P2, T2]):
         self._complete = threading.Event()
         self._lock = threading.Lock()
         functools.update_wrapper(self, method) # We cannot supply slots for this object.
+        _threaded_methods.add(self)
 
     @property
     def method(self) -> Callable[P2, T2]:
@@ -163,6 +184,10 @@ class ThreadedMethod(Generic[P2, T2]):
                 object.__setattr__(self, "_result", MISSING)
         finally:
             self._complete.set()
+    
+    def invoke(self, *args: P2.args, **kwargs: P2.kwargs) -> T2:
+        """Clean and performant. Simply call the method, and nothing else."""
+        return self._method(*args, **kwargs)
 
     # start a new background thread and return the Resolve handle
     def threaded_call(self, *args: P2.args, **kwargs: P2.kwargs) -> Resolve[T2]:
@@ -222,16 +247,21 @@ class Wrapper:
             raise AttributeError(f"The '{type(self).__name__}' instance is frozen")
         super().__setattr__(name, value)
 
-def wrap(cls: Optional[Type[T]] = None, /, wrapper: Type[Wrapper] = Wrapper, **kwargs: Any) -> Union[Type[T], Callable[[Type[T]], Type[T]]]:
+def wrap(cls: Optional[Type[T]] = None, /, wrapper: Type[Wrapper] = Wrapper, **kwds: Any) -> Union[Type[T], Callable[[Type[T]], Type[T]]]:
     """
-    Decorator that returns a subclass of the specified wrapper. The wrapper must be inheriting the wrapper
+    Decorator that returns a subclass of the specified wrapper. The wrapper param must be a wrapper inheriting the `Wrapper` class.
     """
 
     if not is_wrapped(wrapper):
         raise TypeError("The wrapper must be inheriting, or be the exact Wrapper.")
 
     def decorator(c: Type[T]) -> Type[T]:
-        wrapped = type(c.__name__, (wrapper,) + c.__bases__, dict(c.__dict__), **kwargs)
+        wrapped = new_class(
+            name = c.__name__, 
+            bases = (wrapper,) + c.__bases__, 
+            kwds = kwds, 
+            exec_body = dict(c.__dict__)
+        )
 
         # the wrapper __init__: initialize the Wrapper base synchronously, then kick off background init
         def new_init(self, *a: Any, **k: Any) -> None:
@@ -249,3 +279,30 @@ def is_wrapped(obj_or_cls: Union[Type[T], T]) -> bool:
     # handle either instances or types
     cls = obj_or_cls if isinstance(obj_or_cls, type) else type(obj_or_cls)
     return issubclass(cls, Wrapper)
+
+def cleanup(timeout: Optional[float] = None) -> None:
+    """Cleanup all threads during the given timeout."""
+    start = time.monotonic()
+    # join threads created via new_basic_thread
+    for thread in list(_threads):
+        if thread is None: continue
+        if not thread.is_alive(): continue
+        remaining = None if timeout is None else max(0.0, timeout - (time.monotonic() - start))
+        thread.join(remaining)
+    _threads.clear()
+
+    # join watcher threads
+    for resolve in list(_resolves):
+        wt = getattr(resolve, "_watch_thread", None)
+        if wt and wt.is_alive():
+            remaining = None if timeout is None else max(0.0, timeout - (time.monotonic() - start))
+            wt.join(remaining)
+    _resolves.clear()
+
+    # join last threads of threaded_methods if present
+    for tm in list(_threaded_methods):
+        t = getattr(tm, "_thread", None)
+        if t and t.is_alive():
+            remaining = None if timeout is None else max(0.0, timeout - (time.monotonic() - start))
+            t.join(remaining)
+    _threaded_methods.clear()
