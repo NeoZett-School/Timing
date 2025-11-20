@@ -42,6 +42,7 @@ class Resolve(Generic[T3]):
         object.__setattr__(self, "_event", threading.Event())
         object.__setattr__(self, "_value", MISSING)
         object.__setattr__(self, "_exc", None)
+        object.__setattr__(self, "_exc_tb", None)
         _resolves.add(self)
 
     # read-only accessors
@@ -72,7 +73,9 @@ class Resolve(Generic[T3]):
 
     def _set_exception(self, exc: BaseException) -> None:
         with self._lock:
-            tb = sys.exc_info()[2]
+            tb = getattr(exc, "__traceback__", None)
+            if tb is None:
+                tb = sys.exc_info()[2]
             object.__setattr__(self, "_exc", exc)
             object.__setattr__(self, "_exc_tb", tb)
             self._event.set()
@@ -189,7 +192,7 @@ class ThreadedMethod(Generic[P2, T2]):
             resolve._set_value(val)
             with self._lock:
                 object.__setattr__(self, "_last_result", val)
-        except BaseException as e:
+        except Exception as e:
             resolve._set_exception(e)
             with self._lock:
                 object.__setattr__(self, "_last_result", MISSING)
