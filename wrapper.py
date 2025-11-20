@@ -9,9 +9,7 @@ import weakref
 import threading
 import functools
 import time
-
-class ThreadedException(Exception):
-    """Any exception that is threaded."""
+import sys
 
 T = TypeVar("T")
 T2 = TypeVar("T2")
@@ -33,12 +31,12 @@ def new_basic_thread(target: Callable[..., Any], *args: Any, **kwargs: Any) -> t
     return thread
 
 class Resolve(Generic[T3]):
-    __slots__ = ("_threaded_method", "_watch_thread", "_lock", "_rlock", "_event", "_value", "_exc", "__weakref__")
+    __slots__ = ("_threaded_method", "_watch_thread", "_lock", "_rlock", "_event", "_value", "_exc", "_exc_tb", "__weakref__")
 
     def __init__(self, threaded_method: "ThreadedMethod"):
         # use object.__setattr__ to bypass our __setattr__
         object.__setattr__(self, "_threaded_method", threaded_method)
-        object.__setattr__(self, "_watch_thread", threading.Thread(target=self._watcher, daemon=threaded_method._daemon, kwargs={"capture": True}))
+        object.__setattr__(self, "_watch_thread", threading.Thread(target=self._watcher, kwargs={"capture": True}, daemon=True))
         object.__setattr__(self, "_lock", threading.Lock())
         object.__setattr__(self, "_rlock", threading.RLock())
         object.__setattr__(self, "_event", threading.Event())
@@ -74,12 +72,20 @@ class Resolve(Generic[T3]):
 
     def _set_exception(self, exc: BaseException) -> None:
         with self._lock:
+            tb = sys.exc_info()[2]
             object.__setattr__(self, "_exc", exc)
+            object.__setattr__(self, "_exc_tb", tb)
             self._event.set()
     
     def _raise(self) -> None:
-        if self._exc:
-            raise self._exc from ThreadedException(f"Thread failed (ident: {self._threaded_method.thread.ident}), for method: '{self._threaded_method.__name__}'")
+        exc = self._exc
+        tb = getattr(self, "_exc_tb", None)
+        if exc is None:
+            return
+        # Prefer re-raising original exception with original traceback
+        if tb is not None:
+            raise exc.with_traceback(tb)
+        raise exc
 
     # External API to start a watcher thread that will capture parent result when ready.
     def start_recording(self) -> None:
@@ -90,18 +96,24 @@ class Resolve(Generic[T3]):
     # capture attempt (non-blocking) -- returns captured value or None
     def capture(self) -> Optional[T3]:
         """Capture the result in this very moment."""
-        # If parent completed and parent _result isn't MISSING, capture it.
-        parent = self._threaded_method
-        parent_result = getattr(self._threaded_method, "_result", MISSING)
+        # Prefer our own captured state (per-call). If exception present, raise it.
         with self._rlock:
             if self._exc is not None:
                 self._raise()
-            if parent.complete and parent_result is not MISSING:
-                # set parent's result into us if we don't have it yet
-                if self._value is MISSING:
+            if self._value is not MISSING:
+                return self._value
+
+        # Backwards-compat: if parent has a last-result and we haven't been set yet,
+        # adopt it. (Note: parent._result is *last* run — may be racy if there are
+        # concurrent calls; prefer per-call resolve for correctness.)
+        parent = self._threaded_method
+        parent_result = getattr(parent, "_last_result", MISSING)
+        if parent.complete and parent_result is not MISSING:
+            with self._rlock:
+                if self._value is MISSING and self._exc is None:
                     self._set_value(parent_result)
                     return parent_result
-        return self.value
+        return None
 
     # watcher thread function used by start_recording
     def _watcher(self, timeout: Optional[float] = None, capture: bool = False) -> Optional[T3]:
@@ -124,9 +136,8 @@ class Resolve(Generic[T3]):
         if self._exc is not None:
             self._raise()
         # at this point _value must be set
-        val = self.value
         # hinting: mypy won't deduce but runtime is fine
-        return val  # type: ignore[return-value]
+        return self.value  # type: ignore[return-value]
     
     def wait(self, timeout: Optional[float] = None) -> bool:
         """Wait for the method to complete."""
@@ -142,9 +153,9 @@ class ThreadedMethod(Generic[P2, T2]):
     def __init__(self, method: Callable[P2, T2], daemon: bool = True) -> None:
         self._method = method
         self._daemon = daemon
-        self._thread: Optional[threading.Thread] = None
-        self._resolve: Optional[Resolve[T2]] = None
-        self._result: Union[T2, object] = MISSING
+        self._last_thread: Optional[threading.Thread] = None
+        self._last_resolve: Optional[Resolve[T2]] = None
+        self._last_result: Union[T2, object] = MISSING
         self._complete = threading.Event()
         self._lock = threading.Lock()
         functools.update_wrapper(self, method) # We cannot supply slots for this object.
@@ -156,7 +167,7 @@ class ThreadedMethod(Generic[P2, T2]):
 
     @property
     def thread(self) -> Optional[threading.Thread]:
-        return self._thread
+        return self._last_thread
 
     @property
     def complete(self) -> bool:
@@ -165,9 +176,9 @@ class ThreadedMethod(Generic[P2, T2]):
     @property
     def result(self) -> Optional[T2]:
         # None if not complete or value is the MISSING sentinel
-        if self._result is MISSING or not self.complete:
+        if self._last_result is MISSING or not self.complete:
             return None
-        return self._result  # type: ignore[return-value]
+        return self._last_result  # type: ignore[return-value]
 
     # internal runner invoked in the worker thread
     def _runner(self, resolve: Resolve[T2], *args: P2.args, **kwargs: P2.kwargs) -> None:
@@ -177,11 +188,11 @@ class ThreadedMethod(Generic[P2, T2]):
             # publish to resolve first (so resolves waiting on parental capture will see it)
             resolve._set_value(val)
             with self._lock:
-                object.__setattr__(self, "_result", val)
+                object.__setattr__(self, "_last_result", val)
         except BaseException as e:
             resolve._set_exception(e)
             with self._lock:
-                object.__setattr__(self, "_result", MISSING)
+                object.__setattr__(self, "_last_result", MISSING)
         finally:
             self._complete.set()
     
@@ -193,10 +204,10 @@ class ThreadedMethod(Generic[P2, T2]):
     def threaded_call(self, *args: P2.args, **kwargs: P2.kwargs) -> Resolve[T2]:
         # create the Resolve before starting thread and attach it to self
         res = Resolve[T2](self)
-        object.__setattr__(self, "_resolve", res)
+        object.__setattr__(self, "_last_resolve", res)
         # create thread configured with daemon flag
-        self._thread = threading.Thread(target=self._runner, args=(res,)+args, kwargs=kwargs, daemon=self._daemon)
-        self._thread.start()
+        self._last_thread = threading.Thread(target=self._runner, args=(res,)+args, kwargs=kwargs, daemon=self._daemon)
+        self._last_thread.start()
         return res
 
     def __call__(self, *args: P2.args, **kwargs: P2.kwargs) -> Resolve[T2]:
@@ -256,11 +267,19 @@ def wrap(cls: Optional[Type[T]] = None, /, wrapper: Type[Wrapper] = Wrapper, **k
         raise TypeError("The wrapper must be inheriting, or be the exact Wrapper.")
 
     def decorator(c: Type[T]) -> Type[T]:
+        def exec_body(ns):
+            # copy attributes from original class into the new namespace
+            for name, val in c.__dict__.items():
+                # skip special attributes that shouldn't be copied verbatim
+                if name in ("__dict__", "__weakref__", "__module__"):
+                    continue
+                ns[name] = val
+
         wrapped = new_class(
             name = c.__name__, 
             bases = (wrapper,) + c.__bases__, 
             kwds = kwds, 
-            exec_body = dict(c.__dict__)
+            exec_body = exec_body
         )
 
         # the wrapper __init__: initialize the Wrapper base synchronously, then kick off background init
