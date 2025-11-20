@@ -67,11 +67,13 @@ class Resolve(Generic[T3]):
 
     # External API to start a watcher thread that will capture parent result when ready.
     def start_recording(self) -> None:
+        """Start recording the result, whenever it occures. You can only call this once."""
         if not self._watch_thread.is_alive():
             self._watch_thread.start()
 
     # capture attempt (non-blocking) -- returns captured value or None
     def capture(self) -> Optional[T3]:
+        """Capture the result in this very moment."""
         # If parent completed and parent _result isn't MISSING, capture it.
         parent = self._threaded_method
         parent_result = parent._result
@@ -94,6 +96,7 @@ class Resolve(Generic[T3]):
 
     # wait-for-result API (blocks like concurrent.futures.Future.result)
     def result(self, timeout: Optional[float] = None) -> T3:
+        """Wait for the result and return it."""
         finished = self._event.wait(timeout)
         if not finished:
             raise TimeoutError("Resolve.result() timed out")
@@ -106,6 +109,7 @@ class Resolve(Generic[T3]):
         return val  # type: ignore[return-value]
     
     def wait(self, timeout: Optional[float] = None) -> bool:
+        """Wait for the method to complete."""
         finished = self._event.wait(timeout)
         if self._exc is not None:
             self._raise()
@@ -174,6 +178,9 @@ class ThreadedMethod(Generic[P2, T2]):
         return self.threaded_call(*args, **kwargs)
 
 def threaded(func: Optional[Callable[P2, T2]] = None, /, daemon: bool = True) -> Union[ThreadedMethod[P2, T2], Callable[[Callable[P2, T2]], ThreadedMethod[P2, T2]]]:
+    """
+    Create a new threaded method of the given function.
+    """
     def decorator(f: Callable[P2, T2]) -> ThreadedMethod[P2, T2]:
         return ThreadedMethod(f, daemon=daemon)
     if func:
@@ -181,6 +188,10 @@ def threaded(func: Optional[Callable[P2, T2]] = None, /, daemon: bool = True) ->
     return decorator
 
 def new_thread_resolve(func: ThreadedMethod[P2, T2]) -> Resolve[T2]:
+    """
+    Create a new thread resolve with the given parenting thread method.
+    This will not automatically record the result, unless you call `start_recording`.
+    """
     return Resolve[T2](func)
 
 def is_threaded(func: Union[Callable[P2, T2], ThreadedMethod[P2, T2]]) -> bool:
