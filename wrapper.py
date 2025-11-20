@@ -75,12 +75,10 @@ class Resolve(Generic[T3]):
         # If parent completed and parent _result isn't MISSING, capture it.
         parent = self._threaded_method
         parent_result = parent._result
-        if parent.complete and parent_result is not MISSING:
+        if parent.complete and parent_result is not MISSING and self._value is MISSING:
             # set parent's result into us if we don't have it yet
-            with self._lock:
-                if self._value is MISSING:
-                    self._set_value(parent_result)
-                    return parent_result
+            self._set_value(parent_result)
+            return parent_result
         return self.value
 
     # watcher thread function used by start_recording
