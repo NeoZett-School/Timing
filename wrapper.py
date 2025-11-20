@@ -320,7 +320,7 @@ def cleanup(timeout: Optional[float] = None) -> None:
 
     # join last threads of threaded_methods if present
     for tm in list(_threaded_methods):
-        t = getattr(tm, "_thread", None)
+        t = getattr(tm, "_last_thread", None)
         if t and t.is_alive():
             remaining = None if timeout is None else max(0.0, timeout - (time.monotonic() - start))
             t.join(remaining)
