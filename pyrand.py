@@ -95,7 +95,7 @@ class RandomDef:
         return definition._random.choices(real, chance)[0]
     
     @wrapper.threaded
-    def choice(definition: "Random", *args: Any, items: Optional[Iterable[Object]] = None) -> Any:
+    def choice(definition: "Random", *args: Any, items: Optional[Iterable[Any]] = None) -> Any:
         return definition._random.choice(list(items or []) + list(args))
 
 class Random(RandomDef):
@@ -108,7 +108,7 @@ class Random(RandomDef):
     def randobj(self, *args: Object, items: Optional[Iterable[Object]] = None) -> wrapper.Resolve[Any]:
         return RandomDef.randobj(self, *args, items=items)
     
-    def choice(self, *args: Any, items: Optional[Iterable[Object]] = None) -> wrapper.Resolve[Any]:
+    def choice(self, *args: Any, items: Optional[Iterable[Any]] = None) -> wrapper.Resolve[Any]:
         return RandomDef.choice(self, *args, items=items)
 
     @staticmethod
@@ -124,5 +124,7 @@ class AbsoluteRandom(Random):
         return Random.random(self).result()
     def randint(self, a: int, b: int) -> int:
         return Random.randint(self, a, b).result()
-    def choice(self, *args: Object, items: Optional[Iterable[Object]] = None) -> Any:
+    def randobj(self, *args: Object, items: Optional[Iterable[Object]] = None) -> Any:
+        return Random.randobj(self, *args, items=items).result()
+    def choice(self, *args: Any, items: Optional[Iterable[Any]] = None) -> Any:
         return Random.choice(self, *args, items=items).result()
